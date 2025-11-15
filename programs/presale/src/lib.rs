@@ -32,7 +32,6 @@ pub mod presale {
     pub fn initialize(ctx: Context<Initialize>, params: InitializeParams) -> Result<()> {
         let state = &mut ctx.accounts.state;
 
-        require!(params.tge_bps <= BPS_MAX, PresaleError::InvalidBps);
         require!(params.start_ts < params.end_ts, PresaleError::InvalidTime);
         require!(params.hard_cap_lamports > 0, PresaleError::InvalidCap);
         require!(
@@ -49,9 +48,6 @@ pub mod presale {
         state.end_ts = params.end_ts;
 
         state.tge_ts = params.tge_ts;
-        state.tge_bps = params.tge_bps;
-        state.cliff_seconds = params.cliff_seconds;
-        state.vesting_seconds = params.vesting_seconds;
 
         state.soft_cap_lamports = params.soft_cap_lamports;
         state.hard_cap_lamports = params.hard_cap_lamports;
@@ -377,9 +373,6 @@ pub struct InitializeParams {
     pub start_ts: u64,
     pub end_ts: u64,
     pub tge_ts: u64,
-    pub tge_bps: u16,
-    pub cliff_seconds: u64,
-    pub vesting_seconds: u64,
     pub soft_cap_lamports: u64,
     pub hard_cap_lamports: u64,
     pub phase1_tokens_per_sol: u64,
@@ -543,9 +536,6 @@ pub struct PresaleState {
     pub start_ts: u64,
     pub end_ts: u64,
     pub tge_ts: u64,
-    pub tge_bps: u16,
-    pub cliff_seconds: u64,
-    pub vesting_seconds: u64,
     pub soft_cap_lamports: u64,
     pub hard_cap_lamports: u64,
     pub total_raised_lamports: u64,
