@@ -8,6 +8,8 @@ declare_id!("H8f7TyKannRfECDjYqEpiMXjqDxAxjfRLRBaL2op2Kcx");
 // Constantes
 // -----------------------------
 const BPS_MAX: u16 = 10_000;
+const WEEK_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 dias em segundos
+const RELEASE_PERCENTAGE: u16 = 750; // 7.5% em BPS
 
 // -----------------------------
 // Enums e Structs
@@ -57,9 +59,9 @@ pub mod presale {
 
         // Configuração das fases
         state.current_phase = Phase::Whitelist;
-        state.phase1_tokens_per_sol = params.phase1_tokens_per_sol; // 1000 tokens por SOL (0.001 SOL cada)
-        state.phase2_tokens_per_sol = params.phase2_tokens_per_sol; // 100 tokens por SOL (0.01 SOL cada)
-        state.phase3_tokens_per_sol = params.phase3_tokens_per_sol; // 66.666 tokens por SOL (0.015 SOL cada)
+        state.phase1_tokens_per_sol = params.phase1_tokens_per_sol;
+        state.phase2_tokens_per_sol = params.phase2_tokens_per_sol;
+        state.phase3_tokens_per_sol = params.phase3_tokens_per_sol;
 
         state.phase1_tokens_offered = params.phase1_tokens_offered;
         state.phase2_tokens_offered = params.phase2_tokens_offered;
@@ -70,7 +72,6 @@ pub mod presale {
         state.phase3_sold_tokens = 0;
 
         state.finalized = false;
-        state.canceled = false;
 
         // Verificações de vault
         require_keys_eq!(
@@ -87,8 +88,8 @@ pub mod presale {
         Ok(())
     }
 
-    /// Define ou atualiza a alocação máxima (em lamports) para um comprador whitelistado.
-    pub fn whitelist_set(ctx: Context<WhitelistSet>, max_contribution_lamports: u64) -> Result<()> {
+    /// Adiciona um comprador à whitelist
+    pub fn whitelist_set(ctx: Context<WhitelistSet>) -> Result<()> {
         let state = &ctx.accounts.state;
         require!(
             state.authority == ctx.accounts.authority.key(),
@@ -99,16 +100,15 @@ pub mod presale {
         let w = &mut ctx.accounts.whitelist;
         w.state = state.key();
         w.buyer = ctx.accounts.buyer.key();
-        w.max_contribution_lamports = max_contribution_lamports;
         Ok(())
     }
+
 
     /// Avança para a próxima fase (somente autoridade)
     pub fn advance_phase(ctx: Context<AdvancePhase>) -> Result<()> {
         let state = &mut ctx.accounts.state;
 
         require!(!state.finalized, PresaleError::AlreadyFinalized);
-        require!(!state.canceled, PresaleError::SaleCanceled);
 
         match state.current_phase {
             Phase::Whitelist => {
@@ -130,7 +130,6 @@ pub mod presale {
         let clock = Clock::get()?;
         let state = &mut ctx.accounts.state;
 
-        require!(!state.canceled, PresaleError::SaleCanceled);
         require!(!state.finalized, PresaleError::AlreadyFinalized);
         require!(
             clock.unix_timestamp as u64 >= state.start_ts,
@@ -144,27 +143,18 @@ pub mod presale {
         // Verifica se a fase atual permite a compra
         match state.current_phase {
             Phase::Whitelist => {
-                // Na fase whitelist, verifica se o comprador está na whitelist
                 let wl = &ctx.accounts.whitelist;
-
                 require_keys_eq!(wl.state, state.key(), PresaleError::InvalidWhitelist);
                 require_keys_eq!(
                     wl.buyer,
                     ctx.accounts.buyer.key(),
                     PresaleError::InvalidWhitelist
                 );
-                require!(
-                    lamports <= wl.max_contribution_lamports,
-                    PresaleError::PerWalletLimitExceeded
-                );
+                // Sem limite de contribuição para whitelist - apenas verifica se está na lista
             }
-            Phase::Public | Phase::Final => {
-                // Fases públicas - qualquer um pode comprar
-                // Não precisa fazer verificações de whitelist
-            }
+            Phase::Public | Phase::Final => {}
         }
 
-        // Checa caps globais
         require!(
             state.total_raised_lamports + lamports <= state.hard_cap_lamports,
             PresaleError::HardCapExceeded
@@ -181,6 +171,7 @@ pub mod presale {
             buyer_state.phase1_tokens = 0;
             buyer_state.phase2_tokens = 0;
             buyer_state.phase3_tokens = 0;
+            buyer_state.last_claim_ts = 0;
         }
 
         require_keys_eq!(
@@ -201,7 +192,6 @@ pub mod presale {
             Phase::Final => state.phase3_tokens_per_sol,
         };
 
-        // Verifica se há tokens disponíveis na fase
         let tokens = mul_div_u128(lamports as u128, tokens_per_sol as u128, 1_000_000_000u128)
             .map_err(|_| PresaleError::MathOverflow)? as u64;
 
@@ -250,7 +240,7 @@ pub mod presale {
             }
         }
 
-        // Transfere SOL (lamports) do comprador para a PDA (conta `state`)
+        // Transfere SOL do comprador para a PDA
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.buyer.key(),
             &state.key(),
@@ -265,7 +255,6 @@ pub mod presale {
             ],
         )?;
 
-        // Atualiza totals
         buyer_state.contributed_lamports = buyer_state
             .contributed_lamports
             .checked_add(lamports)
@@ -284,71 +273,22 @@ pub mod presale {
         Ok(())
     }
 
-    /// Finaliza a venda (somente autoridade), se soft cap atingido e período encerrado.
+    /// Finaliza a venda (somente autoridade)
     pub fn finalize(ctx: Context<OnlyAuthority>) -> Result<()> {
         let clock = Clock::get()?;
         let state = &mut ctx.accounts.state;
 
         require!(!state.finalized, PresaleError::AlreadyFinalized);
-        require!(!state.canceled, PresaleError::SaleCanceled);
         require!(
             clock.unix_timestamp as u64 >= state.end_ts,
             PresaleError::SaleNotEnded
-        );
-        require!(
-            state.total_raised_lamports >= state.soft_cap_lamports,
-            PresaleError::SoftCapNotMet
         );
 
         state.finalized = true;
         Ok(())
     }
 
-    /// Cancela a venda (permite refund).
-    pub fn cancel(ctx: Context<OnlyAuthority>) -> Result<()> {
-        let state = &mut ctx.accounts.state;
-        require!(!state.finalized, PresaleError::AlreadyFinalized);
-        state.canceled = true;
-        Ok(())
-    }
-
-    /// Refund para o comprador se a venda terminou sem atingir soft cap ou foi cancelada.
-    pub fn refund(ctx: Context<Refund>) -> Result<()> {
-        let clock = Clock::get()?;
-        let state = &mut ctx.accounts.state;
-        let buyer_state = &mut ctx.accounts.buyer_state;
-
-        let ended = clock.unix_timestamp as u64 > state.end_ts;
-        require!(
-            state.canceled || (ended && state.total_raised_lamports < state.soft_cap_lamports),
-            PresaleError::RefundNotAvailable
-        );
-        require!(
-            buyer_state.contributed_lamports > 0,
-            PresaleError::NothingToRefund
-        );
-
-        let amount = buyer_state.contributed_lamports;
-        buyer_state.contributed_lamports = 0;
-        buyer_state.allocated_tokens = 0;
-        buyer_state.phase1_tokens = 0;
-        buyer_state.phase2_tokens = 0;
-        buyer_state.phase3_tokens = 0;
-
-        // Transfere lamports da PDA `state` para o comprador
-        **state.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **ctx
-            .accounts
-            .buyer
-            .to_account_info()
-            .try_borrow_mut_lamports()? += amount;
-
-        Ok(())
-    }
-
-    /// Claim de tokens de acordo com o cronograma de vesting.
-    /// IMPORTANTE: Apenas 40% dos tokens comprados estão disponíveis para claim
-    /// 60% estão locked permanentemente
+    /// Claim de tokens com novo sistema de vesting
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
         let clock = Clock::get()?;
         let state = &ctx.accounts.state;
@@ -360,34 +300,20 @@ pub mod presale {
             PresaleError::NothingToClaim
         );
 
-        // Calcula o total de tokens disponíveis para claim (40% do total alocado)
-        let total_claimable_tokens = mul_div_u128(
-            buyer_state.allocated_tokens as u128,
-            4000, // 40% em BPS
-            BPS_MAX as u128,
-        ).map_err(|_| PresaleError::MathOverflow)? as u64;
-
-        let vested_bps = compute_vested_bps(
-            clock.unix_timestamp as u64,
+        let current_time = clock.unix_timestamp as u64;
+        
+        // Calcula tokens claimáveis com novo sistema
+        let claimable = compute_weekly_claimable_tokens(
+            current_time,
             state.tge_ts,
-            state.tge_bps,
-            state.cliff_seconds,
-            state.vesting_seconds,
-        );
-
-        let vested_tokens = mul_div_u128(
-            total_claimable_tokens as u128,
-            vested_bps as u128,
-            BPS_MAX as u128,
-        ).map_err(|_| PresaleError::MathOverflow)? as u64;
-
-        let claimable = vested_tokens
-            .checked_sub(buyer_state.claimed_tokens)
-            .ok_or(PresaleError::MathOverflow)?;
+            buyer_state.allocated_tokens,
+            buyer_state.claimed_tokens,
+            buyer_state.last_claim_ts,
+        )?;
 
         require!(claimable > 0, PresaleError::NothingToClaim);
 
-        // Transfere do vault (ATA da PDA) para o ATA do comprador
+        // Transfere tokens do vault para o buyer
         let seeds = &[
             b"state".as_ref(),
             state.authority.as_ref(),
@@ -409,14 +335,18 @@ pub mod presale {
 
         token::transfer(cpi_ctx, claimable)?;
 
+        // Atualiza estado do buyer
         buyer_state.claimed_tokens = buyer_state
             .claimed_tokens
             .checked_add(claimable)
             .ok_or(PresaleError::MathOverflow)?;
+        
+        buyer_state.last_claim_ts = current_time;
+
         Ok(())
     }
 
-    /// Transfere os fundos arrecadados (SOL) para a tesouraria, somente após finalização.
+    /// Transfere os fundos arrecadados (SOL) para a tesouraria
     pub fn withdraw_funds(ctx: Context<OnlyAuthority>) -> Result<()> {
         let state = &mut ctx.accounts.state;
         require!(state.finalized, PresaleError::NotFinalized);
@@ -452,15 +382,12 @@ pub struct InitializeParams {
     pub vesting_seconds: u64,
     pub soft_cap_lamports: u64,
     pub hard_cap_lamports: u64,
-
-    // Configuração das fases
-    pub phase1_tokens_per_sol: u64, // 1000 tokens por SOL (preço 0.001 SOL)
-    pub phase2_tokens_per_sol: u64, // 100 tokens por SOL (preço 0.01 SOL)
-    pub phase3_tokens_per_sol: u64, // 66.666 tokens por SOL (preço 0.015 SOL)
-
-    pub phase1_tokens_offered: u64, // 17,422,222 tokens
-    pub phase2_tokens_offered: u64, // 16,447,368 tokens
-    pub phase3_tokens_offered: u64, // 15,555,556 tokens
+    pub phase1_tokens_per_sol: u64,
+    pub phase2_tokens_per_sol: u64,
+    pub phase3_tokens_per_sol: u64,
+    pub phase1_tokens_offered: u64,
+    pub phase2_tokens_offered: u64,
+    pub phase3_tokens_offered: u64,
 }
 
 #[derive(Accounts)]
@@ -468,19 +395,15 @@ pub struct InitializeParams {
 pub struct Initialize<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
-
     pub mint: Account<'info, Mint>,
-
     #[account(
         mut,
         constraint = vault.owner == state.key(),
         constraint = vault.mint == mint.key(),
     )]
     pub vault: Account<'info, TokenAccount>,
-
     #[account(
         init,
         payer = authority,
@@ -489,7 +412,6 @@ pub struct Initialize<'info> {
         bump
     )]
     pub state: Account<'info, PresaleState>,
-
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -500,16 +422,13 @@ pub struct Initialize<'info> {
 pub struct WhitelistSet<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
         bump = state.bump
     )]
     pub state: Account<'info, PresaleState>,
-
     pub buyer: UncheckedAccount<'info>,
-
     #[account(
         init_if_needed,
         payer = authority,
@@ -518,7 +437,6 @@ pub struct WhitelistSet<'info> {
         bump
     )]
     pub whitelist: Account<'info, WhitelistEntry>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -526,7 +444,6 @@ pub struct WhitelistSet<'info> {
 pub struct AdvancePhase<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
@@ -540,14 +457,12 @@ pub struct AdvancePhase<'info> {
 pub struct Buy<'info> {
     #[account(mut)]
     pub buyer: Signer<'info>,
-
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
         bump = state.bump
     )]
     pub state: Account<'info, PresaleState>,
-
     #[account(
         init_if_needed,
         payer = buyer,
@@ -556,14 +471,11 @@ pub struct Buy<'info> {
         bump
     )]
     pub buyer_state: Account<'info, BuyerState>,
-
-    /// Whitelist account - só é obrigatória na Phase::Whitelist
     #[account(
         seeds = [b"whitelist", state.key().as_ref(), buyer.key().as_ref()],
         bump
     )]
     pub whitelist: Account<'info, WhitelistEntry>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -571,7 +483,6 @@ pub struct Buy<'info> {
 pub struct OnlyAuthority<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
@@ -579,59 +490,33 @@ pub struct OnlyAuthority<'info> {
         constraint = state.authority == authority.key() @ PresaleError::Unauthorized,
     )]
     pub state: Account<'info, PresaleState>,
-
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
-
     pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct Refund<'info> {
-    #[account(mut)]
-    pub buyer: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
-        bump = state.bump
-    )]
-    pub state: Account<'info, PresaleState>,
-
-    #[account(
-        mut,
-        seeds = [b"buyer", state.key().as_ref(), buyer.key().as_ref()],
-        bump
-    )]
-    pub buyer_state: Account<'info, BuyerState>,
 }
 
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
     pub buyer: Signer<'info>,
-
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
         bump = state.bump
     )]
     pub state: Account<'info, PresaleState>,
-
     #[account(
         mut,
         seeds = [b"buyer", state.key().as_ref(), buyer.key().as_ref()],
         bump
     )]
     pub buyer_state: Account<'info, BuyerState>,
-
     #[account(
         mut,
         constraint = vault.owner == state.key(),
         constraint = vault.mint == state.mint
     )]
     pub vault: Account<'info, TokenAccount>,
-
     #[account(
         init_if_needed,
         payer = buyer,
@@ -639,9 +524,7 @@ pub struct Claim<'info> {
         associated_token::authority = buyer
     )]
     pub buyer_ata: Account<'info, TokenAccount>,
-
     pub mint: Account<'info, Mint>,
-
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -657,66 +540,31 @@ pub struct PresaleState {
     pub mint: Pubkey,
     pub vault: Pubkey,
     pub treasury: Pubkey,
-
     pub start_ts: u64,
     pub end_ts: u64,
-
     pub tge_ts: u64,
     pub tge_bps: u16,
     pub cliff_seconds: u64,
     pub vesting_seconds: u64,
-
     pub soft_cap_lamports: u64,
     pub hard_cap_lamports: u64,
     pub total_raised_lamports: u64,
-
-    // Configuração das fases
     pub current_phase: Phase,
     pub phase1_tokens_per_sol: u64,
     pub phase2_tokens_per_sol: u64,
     pub phase3_tokens_per_sol: u64,
-
     pub phase1_tokens_offered: u64,
     pub phase2_tokens_offered: u64,
     pub phase3_tokens_offered: u64,
-
     pub phase1_sold_tokens: u64,
     pub phase2_sold_tokens: u64,
     pub phase3_sold_tokens: u64,
-
     pub finalized: bool,
-    pub canceled: bool,
-
     pub bump: u8,
 }
 
 impl PresaleState {
-    pub const SIZE: usize = 32
-        + 32
-        + 32
-        + 32
-        + 8
-        + 8
-        + 8
-        + 2
-        + 8
-        + 8
-        + 8
-        + 8
-        + 8
-        + 1
-        + 8
-        + 8
-        + 8
-        + 8
-        + 8
-        + 8
-        + 8
-        + 8
-        + 8
-        + 1
-        + 1
-        + 1;
+    pub const SIZE: usize = 32 + 32 + 32 + 32 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 1;
 }
 
 #[account]
@@ -729,19 +577,21 @@ pub struct BuyerState {
     pub phase1_tokens: u64,
     pub phase2_tokens: u64,
     pub phase3_tokens: u64,
+    pub last_claim_ts: u64,
 }
+
 impl BuyerState {
-    pub const SIZE: usize = 32 + 32 + 8 + 8 + 8 + 8 + 8 + 8;
+    pub const SIZE: usize = 32 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 8;
 }
 
 #[account]
 pub struct WhitelistEntry {
     pub state: Pubkey,
     pub buyer: Pubkey,
-    pub max_contribution_lamports: u64,
 }
+
 impl WhitelistEntry {
-    pub const SIZE: usize = 32 + 32 + 8;
+    pub const SIZE: usize = 32 + 32;
 }
 
 // -----------------------------
@@ -760,39 +610,50 @@ fn mul_div_u128(a: u128, b: u128, denom: u128) -> std::result::Result<u128, Pres
     }
 }
 
-fn compute_vested_bps(
-    now_ts: u64,
+/// Calcula tokens claimáveis com novo sistema: 40% no TGE + 7.5% por semana
+fn compute_weekly_claimable_tokens(
+    current_time: u64,
     tge_ts: u64,
-    tge_bps: u16,
-    cliff_seconds: u64,
-    vesting_seconds: u64,
-) -> u16 {
-    if now_ts < tge_ts {
-        return 0;
-    }
-    let mut total_bps = tge_bps as u64;
-
-    let cliff_end = tge_ts.saturating_add(cliff_seconds);
-    if vesting_seconds == 0 {
-        return total_bps.min(BPS_MAX as u64) as u16;
-    }
-    if now_ts <= cliff_end {
-        return total_bps.min(BPS_MAX as u64) as u16;
+    allocated_tokens: u64,
+    already_claimed: u64,
+    last_claim_ts: u64,
+) -> Result<u64> {
+    if current_time < tge_ts {
+        return Ok(0);
     }
 
-    let elapsed = now_ts.saturating_sub(cliff_end);
-    let linear_bps_max = (BPS_MAX as u64).saturating_sub(total_bps);
-    let linear_bps = if elapsed >= vesting_seconds {
-        linear_bps_max
-    } else {
-        (elapsed as u128)
-            .saturating_mul(linear_bps_max as u128)
-            .checked_div(vesting_seconds as u128)
-            .unwrap_or(0) as u64
-    };
+    // 40% disponível imediatamente no TGE
+    let tge_tokens = mul_div_u128(allocated_tokens as u128, 4000, BPS_MAX as u128)
+        .map_err(|_| PresaleError::MathOverflow)? as u64;
 
-    total_bps = total_bps.saturating_add(linear_bps);
-    total_bps.min(BPS_MAX as u64) as u16
+    // Se nunca claimou antes, claima os 40% do TGE
+    if last_claim_ts == 0 {
+        return Ok(tge_tokens);
+    }
+
+    // Calcula semanas passadas desde o último claim
+    let time_since_last_claim = current_time.saturating_sub(last_claim_ts);
+    let weeks_passed = time_since_last_claim / WEEK_SECONDS;
+
+    if weeks_passed == 0 {
+        return Ok(0);
+    }
+
+    // Tokens restantes após TGE (60%)
+    let remaining_tokens = allocated_tokens.saturating_sub(tge_tokens);
+    
+    // 7.5% dos tokens restantes por semana
+    let tokens_per_week = mul_div_u128(remaining_tokens as u128, RELEASE_PERCENTAGE as u128, BPS_MAX as u128)
+        .map_err(|_| PresaleError::MathOverflow)? as u64;
+
+    // Total claimável desde o último claim
+    let newly_claimable = tokens_per_week * weeks_passed as u64;
+
+    // Garante que não claima mais do que o total disponível
+    let total_claimable = tge_tokens + remaining_tokens;
+    let max_claimable_now = total_claimable.saturating_sub(already_claimed);
+
+    Ok(newly_claimable.min(max_claimable_now))
 }
 
 // -----------------------------
@@ -814,12 +675,8 @@ pub enum PresaleError {
     SaleEnded,
     #[msg("Sale not ended")]
     SaleNotEnded,
-    #[msg("Soft cap not met")]
-    SoftCapNotMet,
     #[msg("Sale already finalized")]
     AlreadyFinalized,
-    #[msg("Sale canceled")]
-    SaleCanceled,
     #[msg("Hard cap exceeded")]
     HardCapExceeded,
     #[msg("Per-wallet limit exceeded")]
@@ -834,18 +691,18 @@ pub enum PresaleError {
     InvalidWhitelist,
     #[msg("Invalid buyer state")]
     InvalidBuyerState,
-    #[msg("Nothing to refund")]
-    NothingToRefund,
     #[msg("Nothing to claim")]
     NothingToClaim,
     #[msg("Nothing to withdraw")]
     NothingToWithdraw,
-    #[msg("Refund not available")]
-    RefundNotAvailable,
     #[msg("Not finalized")]
     NotFinalized,
     #[msg("Phase limit exceeded")]
     PhaseLimitExceeded,
     #[msg("Already in final phase")]
     AlreadyFinalPhase,
+    #[msg("Invalid input")]
+    InvalidInput,
+    #[msg("Batch too large")]
+    BatchTooLarge,
 }
