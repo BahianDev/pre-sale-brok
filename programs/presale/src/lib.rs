@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("H8f7TyKannRfECDjYqEpiMXjqDxAxjfRLRBaL2op2Kcx");
+declare_id!("7rGqhCfXu3hHZUinknNSEH7bYAvAn8hUajWPj8EMiC8q");
 
 // -----------------------------
 // Constantes
@@ -31,13 +31,9 @@ pub mod presale {
     /// Inicializa a pre-sale com as fases
     pub fn initialize(ctx: Context<Initialize>, params: InitializeParams) -> Result<()> {
         let state = &mut ctx.accounts.state;
+        let token_decimals = 1_000_000_000; // 9 decimais
 
         require!(params.start_ts < params.end_ts, PresaleError::InvalidTime);
-        require!(params.hard_cap_lamports > 0, PresaleError::InvalidCap);
-        require!(
-            params.soft_cap_lamports <= params.hard_cap_lamports,
-            PresaleError::InvalidCap
-        );
 
         state.authority = ctx.accounts.authority.key();
         state.mint = ctx.accounts.mint.key();
@@ -46,27 +42,34 @@ pub mod presale {
 
         state.start_ts = params.start_ts;
         state.end_ts = params.end_ts;
-
         state.tge_ts = params.tge_ts;
-
-        state.soft_cap_lamports = params.soft_cap_lamports;
-        state.hard_cap_lamports = params.hard_cap_lamports;
         state.total_raised_lamports = 0;
 
         // Configuração das fases
         state.current_phase = Phase::Whitelist;
+
+        // CORREÇÃO: tokens_per_sol já deve vir calculado com decimais
         state.phase1_tokens_per_sol = params.phase1_tokens_per_sol;
         state.phase2_tokens_per_sol = params.phase2_tokens_per_sol;
         state.phase3_tokens_per_sol = params.phase3_tokens_per_sol;
 
-        state.phase1_tokens_offered = params.phase1_tokens_offered;
-        state.phase2_tokens_offered = params.phase2_tokens_offered;
-        state.phase3_tokens_offered = params.phase3_tokens_offered;
+        // CORREÇÃO: Multiplica os limites oferecidos pelos decimais
+        state.phase1_tokens_offered = params
+            .phase1_tokens_offered
+            .checked_mul(token_decimals)
+            .ok_or(PresaleError::MathOverflow)?;
+        state.phase2_tokens_offered = params
+            .phase2_tokens_offered
+            .checked_mul(token_decimals)
+            .ok_or(PresaleError::MathOverflow)?;
+        state.phase3_tokens_offered = params
+            .phase3_tokens_offered
+            .checked_mul(token_decimals)
+            .ok_or(PresaleError::MathOverflow)?;
 
         state.phase1_sold_tokens = 0;
         state.phase2_sold_tokens = 0;
         state.phase3_sold_tokens = 0;
-
         state.finalized = false;
 
         // Verificações de vault
@@ -99,7 +102,6 @@ pub mod presale {
         Ok(())
     }
 
-
     /// Avança para a próxima fase (somente autoridade)
     pub fn advance_phase(ctx: Context<AdvancePhase>) -> Result<()> {
         let state = &mut ctx.accounts.state;
@@ -120,8 +122,6 @@ pub mod presale {
 
         Ok(())
     }
-
-    /// Compra (envia SOL). Registra contribuição e aloca tokens pelo preço da fase atual.
     pub fn buy(ctx: Context<Buy>, lamports: u64) -> Result<()> {
         let clock = Clock::get()?;
         let state = &mut ctx.accounts.state;
@@ -146,15 +146,9 @@ pub mod presale {
                     ctx.accounts.buyer.key(),
                     PresaleError::InvalidWhitelist
                 );
-                // Sem limite de contribuição para whitelist - apenas verifica se está na lista
             }
             Phase::Public | Phase::Final => {}
         }
-
-        require!(
-            state.total_raised_lamports + lamports <= state.hard_cap_lamports,
-            PresaleError::HardCapExceeded
-        );
 
         // Atualiza buyer state
         let buyer_state = &mut ctx.accounts.buyer_state;
@@ -181,20 +175,35 @@ pub mod presale {
             PresaleError::InvalidBuyerState
         );
 
-        // Calcula tokens baseado na fase atual
+        // CÁLCULO CORRETO E SEGURO: Usando u128 para evitar overflow
         let tokens_per_sol = match state.current_phase {
             Phase::Whitelist => state.phase1_tokens_per_sol,
             Phase::Public => state.phase2_tokens_per_sol,
             Phase::Final => state.phase3_tokens_per_sol,
         };
 
-        let tokens = mul_div_u128(lamports as u128, tokens_per_sol as u128, 1_000_000_000u128)
-            .map_err(|_| PresaleError::MathOverflow)? as u64;
+        // Converter para u128 para cálculos seguros
+        let lamports_128 = lamports as u128;
+        let tokens_per_sol_128 = tokens_per_sol as u128;
+        let token_decimals = 1_000_000_000u128;
+        let sol_decimals = 1_000_000_000u128;
 
+        // Cálculo: (lamports * tokens_per_sol * token_decimals) / sol_decimals
+        let tokens_128 = lamports_128
+            .checked_mul(tokens_per_sol_128)
+            .and_then(|v| v.checked_mul(token_decimals))
+            .and_then(|v| v.checked_div(sol_decimals))
+            .ok_or(PresaleError::MathOverflow)?;
+
+        // Converter de volta para u64 (verificando se não excede u64::MAX)
+        let tokens = u64::try_from(tokens_128).map_err(|_| PresaleError::MathOverflow)?;
+
+        // VERIFICAÇÕES COM VALORES CONSISTENTES
         match state.current_phase {
             Phase::Whitelist => {
                 require!(
-                    state.phase1_sold_tokens + tokens <= state.phase1_tokens_offered,
+                    state.phase1_sold_tokens.checked_add(tokens).is_some()
+                        && state.phase1_sold_tokens + tokens <= state.phase1_tokens_offered,
                     PresaleError::PhaseLimitExceeded
                 );
                 state.phase1_sold_tokens = state
@@ -208,7 +217,8 @@ pub mod presale {
             }
             Phase::Public => {
                 require!(
-                    state.phase2_sold_tokens + tokens <= state.phase2_tokens_offered,
+                    state.phase2_sold_tokens.checked_add(tokens).is_some()
+                        && state.phase2_sold_tokens + tokens <= state.phase2_tokens_offered,
                     PresaleError::PhaseLimitExceeded
                 );
                 state.phase2_sold_tokens = state
@@ -222,7 +232,8 @@ pub mod presale {
             }
             Phase::Final => {
                 require!(
-                    state.phase3_sold_tokens + tokens <= state.phase3_tokens_offered,
+                    state.phase3_sold_tokens.checked_add(tokens).is_some()
+                        && state.phase3_sold_tokens + tokens <= state.phase3_tokens_offered,
                     PresaleError::PhaseLimitExceeded
                 );
                 state.phase3_sold_tokens = state
@@ -251,6 +262,7 @@ pub mod presale {
             ],
         )?;
 
+        // Atualiza todos os valores consistentemente
         buyer_state.contributed_lamports = buyer_state
             .contributed_lamports
             .checked_add(lamports)
@@ -265,6 +277,14 @@ pub mod presale {
             .total_raised_lamports
             .checked_add(lamports)
             .ok_or(PresaleError::MathOverflow)?;
+
+        // DEBUG: Log para verificar os valores
+        msg!("=== DEBUG BUY ===");
+        msg!("Lamports: {}", lamports);
+        msg!("Tokens per SOL: {}", tokens_per_sol);
+        msg!("Tokens calculated: {}", tokens);
+        msg!("Tokens human readable: {}", tokens as f64 / 1_000_000_000.0);
+        msg!("=================");
 
         Ok(())
     }
@@ -297,7 +317,14 @@ pub mod presale {
         );
 
         let current_time = clock.unix_timestamp as u64;
-        
+
+        msg!("=== DEBUG CLAIM ===");
+        msg!("Allocated tokens: {}", buyer_state.allocated_tokens);
+        msg!("Already claimed: {}", buyer_state.claimed_tokens);
+        msg!("Last claim ts: {}", buyer_state.last_claim_ts);
+        msg!("TGE timestamp: {}", state.tge_ts);
+        msg!("Current time: {}", current_time);
+
         // Calcula tokens claimáveis com novo sistema
         let claimable = compute_weekly_claimable_tokens(
             current_time,
@@ -307,6 +334,9 @@ pub mod presale {
             buyer_state.last_claim_ts,
         )?;
 
+        msg!("Claimable tokens: {}", claimable);
+        msg!("===================");
+
         require!(claimable > 0, PresaleError::NothingToClaim);
 
         // Transfere tokens do vault para o buyer
@@ -314,7 +344,7 @@ pub mod presale {
             b"state".as_ref(),
             state.authority.as_ref(),
             state.mint.as_ref(),
-            &[state.bump],
+            &[ctx.bumps.state],
         ];
         let signer = &[&seeds[..]];
 
@@ -336,7 +366,7 @@ pub mod presale {
             .claimed_tokens
             .checked_add(claimable)
             .ok_or(PresaleError::MathOverflow)?;
-        
+
         buyer_state.last_claim_ts = current_time;
 
         Ok(())
@@ -373,8 +403,6 @@ pub struct InitializeParams {
     pub start_ts: u64,
     pub end_ts: u64,
     pub tge_ts: u64,
-    pub soft_cap_lamports: u64,
-    pub hard_cap_lamports: u64,
     pub phase1_tokens_per_sol: u64,
     pub phase2_tokens_per_sol: u64,
     pub phase3_tokens_per_sol: u64,
@@ -418,9 +446,10 @@ pub struct WhitelistSet<'info> {
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
-        bump = state.bump
+        bump
     )]
     pub state: Account<'info, PresaleState>,
+    pub mint: Account<'info, Mint>,
     pub buyer: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
@@ -453,7 +482,7 @@ pub struct Buy<'info> {
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
-        bump = state.bump
+        bump
     )]
     pub state: Account<'info, PresaleState>,
     #[account(
@@ -479,7 +508,7 @@ pub struct OnlyAuthority<'info> {
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
-        bump = state.bump,
+        bump,
         constraint = state.authority == authority.key() @ PresaleError::Unauthorized,
     )]
     pub state: Account<'info, PresaleState>,
@@ -495,7 +524,7 @@ pub struct Claim<'info> {
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
-        bump = state.bump
+        bump
     )]
     pub state: Account<'info, PresaleState>,
     #[account(
@@ -536,8 +565,6 @@ pub struct PresaleState {
     pub start_ts: u64,
     pub end_ts: u64,
     pub tge_ts: u64,
-    pub soft_cap_lamports: u64,
-    pub hard_cap_lamports: u64,
     pub total_raised_lamports: u64,
     pub current_phase: Phase,
     pub phase1_tokens_per_sol: u64,
@@ -554,7 +581,31 @@ pub struct PresaleState {
 }
 
 impl PresaleState {
-    pub const SIZE: usize = 32 + 32 + 32 + 32 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 1;
+    pub const SIZE: usize = 32
+        + 32
+        + 32
+        + 32
+        + 8
+        + 8
+        + 8
+        + 2
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 1
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 1
+        + 1;
 }
 
 #[account]
@@ -601,6 +652,7 @@ fn mul_div_u128(a: u128, b: u128, denom: u128) -> std::result::Result<u128, Pres
 }
 
 /// Calcula tokens claimáveis com novo sistema: 40% no TGE + 7.5% por semana
+/// Calcula tokens claimáveis com novo sistema: 40% no TGE + 7.5% por semana
 fn compute_weekly_claimable_tokens(
     current_time: u64,
     tge_ts: u64,
@@ -612,38 +664,38 @@ fn compute_weekly_claimable_tokens(
         return Ok(0);
     }
 
-    // 40% disponível imediatamente no TGE
-    let tge_tokens = mul_div_u128(allocated_tokens as u128, 4000, BPS_MAX as u128)
-        .map_err(|_| PresaleError::MathOverflow)? as u64;
+    // 40% no TGE
+    let tge_tokens = (allocated_tokens * 4000) / (BPS_MAX as u64);
 
-    // Se nunca claimou antes, claima os 40% do TGE
+    // Primeiro claim: recebe TGE
     if last_claim_ts == 0 {
         return Ok(tge_tokens);
     }
 
-    // Calcula semanas passadas desde o último claim
-    let time_since_last_claim = current_time.saturating_sub(last_claim_ts);
-    let weeks_passed = time_since_last_claim / WEEK_SECONDS;
+    // Se ainda não claimou todo TGE
+    if already_claimed < tge_tokens {
+        return Ok(tge_tokens - already_claimed);
+    }
 
-    if weeks_passed == 0 {
+    // Calcula semanas desde TGE
+    let weeks_since_tge = (current_time - tge_ts) / WEEK_SECONDS;
+
+    if weeks_since_tge == 0 {
         return Ok(0);
     }
 
-    // Tokens restantes após TGE (60%)
-    let remaining_tokens = allocated_tokens.saturating_sub(tge_tokens);
-    
-    // 7.5% dos tokens restantes por semana
-    let tokens_per_week = mul_div_u128(remaining_tokens as u128, RELEASE_PERCENTAGE as u128, BPS_MAX as u128)
-        .map_err(|_| PresaleError::MathOverflow)? as u64;
+    // Tokens restantes (60%)
+    let remaining_tokens = allocated_tokens - tge_tokens;
 
-    // Total claimável desde o último claim
-    let newly_claimable = tokens_per_week * weeks_passed as u64;
+    // 7.5% por semana dos tokens restantes
+    let weekly_release = (remaining_tokens * (RELEASE_PERCENTAGE as u64)) / (BPS_MAX as u64);
 
-    // Garante que não claima mais do que o total disponível
-    let total_claimable = tge_tokens + remaining_tokens;
-    let max_claimable_now = total_claimable.saturating_sub(already_claimed);
+    // Total que deveria estar liberado
+    let total_released = tge_tokens + (weekly_release * weeks_since_tge as u64);
+    let total_released = total_released.min(allocated_tokens);
 
-    Ok(newly_claimable.min(max_claimable_now))
+    // Claimable = total liberado - já claimado
+    Ok(total_released.saturating_sub(already_claimed))
 }
 
 // -----------------------------
