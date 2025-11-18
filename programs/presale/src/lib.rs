@@ -2,13 +2,13 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("7rGqhCfXu3hHZUinknNSEH7bYAvAn8hUajWPj8EMiC8q");
+declare_id!("5f7EJAnEqd8vFw1hjMyg9XcgAdu9YsiJZ5AhTiPyuc1p");
 
 // -----------------------------
 // Constantes
 // -----------------------------
 const BPS_MAX: u16 = 10_000;
-const WEEK_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 dias em segundos
+const WEEK_SECONDS: u64 = 180; // 7 dias em segundos
 const RELEASE_PERCENTAGE: u16 = 750; // 7.5% em BPS
 
 // -----------------------------
@@ -122,6 +122,7 @@ pub mod presale {
 
         Ok(())
     }
+
     pub fn buy(ctx: Context<Buy>, lamports: u64) -> Result<()> {
         let clock = Clock::get()?;
         let state = &mut ctx.accounts.state;
@@ -639,19 +640,6 @@ impl WhitelistEntry {
 // Helpers
 // -----------------------------
 
-fn mul_div_u128(a: u128, b: u128, denom: u128) -> std::result::Result<u128, PresaleError> {
-    if let Some(product) = a.checked_mul(b) {
-        if let Some(result) = product.checked_div(denom) {
-            Ok(result)
-        } else {
-            Err(PresaleError::MathOverflow)
-        }
-    } else {
-        Err(PresaleError::MathOverflow)
-    }
-}
-
-/// Calcula tokens claimáveis com novo sistema: 40% no TGE + 7.5% por semana
 /// Calcula tokens claimáveis com novo sistema: 40% no TGE + 7.5% por semana
 fn compute_weekly_claimable_tokens(
     current_time: u64,
