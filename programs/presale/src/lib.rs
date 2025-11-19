@@ -1,8 +1,9 @@
 use anchor_lang::prelude::*;
+use anchor_lang::system_program::{self, Transfer as SystemTransfer};
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("6XxxoHzTp5ZFsAyfqMhsTEEckSdibt3wfnAMewTcyYNN");
+declare_id!("7V8Dz33M4tV4uPw1egTYaDJEyTUupMFRqZKwfZcZaGgb");
 
 // -----------------------------
 // Constantes
@@ -235,19 +236,14 @@ pub mod presale {
         }
 
         // Transfere SOL do comprador para a PDA
-        let ix = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.buyer.key(),
-            &state.key(),
-            lamports,
-        );
-        anchor_lang::solana_program::program::invoke(
-            &ix,
-            &[
-                ctx.accounts.buyer.to_account_info(),
-                state.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
+        let cpi_accounts = SystemTransfer {
+            from: ctx.accounts.buyer.to_account_info(),
+            to: ctx.accounts.treasury.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
+
+        system_program::transfer(cpi_ctx, lamports)?;
 
         // Atualiza todos os valores consistentemente
         buyer_state.contributed_lamports = buyer_state
@@ -480,6 +476,13 @@ pub struct Buy<'info> {
         bump
     )]
     pub buyer_state: Account<'info, BuyerState>,
+
+    #[account(
+        mut,
+        constraint = treasury.key() == state.treasury @ PresaleError::InvalidInput
+    )]
+    pub treasury: UncheckedAccount<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
