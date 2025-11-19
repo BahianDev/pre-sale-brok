@@ -2,13 +2,13 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("5f7EJAnEqd8vFw1hjMyg9XcgAdu9YsiJZ5AhTiPyuc1p");
+declare_id!("6XxxoHzTp5ZFsAyfqMhsTEEckSdibt3wfnAMewTcyYNN");
 
 // -----------------------------
 // Constantes
 // -----------------------------
 const BPS_MAX: u16 = 10_000;
-const WEEK_SECONDS: u64 = 180; // 7 dias em segundos
+const WEEK_SECONDS: u64 = 120; // 7 dias em segundos
 const RELEASE_PERCENTAGE: u16 = 750; // 7.5% em BPS
 
 // -----------------------------
@@ -136,20 +136,6 @@ pub mod presale {
             clock.unix_timestamp as u64 <= state.end_ts,
             PresaleError::SaleEnded
         );
-
-        // Verifica se a fase atual permite a compra
-        match state.current_phase {
-            Phase::Whitelist => {
-                let wl = &ctx.accounts.whitelist;
-                require_keys_eq!(wl.state, state.key(), PresaleError::InvalidWhitelist);
-                require_keys_eq!(
-                    wl.buyer,
-                    ctx.accounts.buyer.key(),
-                    PresaleError::InvalidWhitelist
-                );
-            }
-            Phase::Public | Phase::Final => {}
-        }
 
         // Atualiza buyer state
         let buyer_state = &mut ctx.accounts.buyer_state;
@@ -470,7 +456,7 @@ pub struct AdvancePhase<'info> {
     #[account(
         mut,
         seeds = [b"state", state.authority.as_ref(), state.mint.as_ref()],
-        bump = state.bump,
+        bump,
         constraint = state.authority == authority.key() @ PresaleError::Unauthorized,
     )]
     pub state: Account<'info, PresaleState>,
@@ -494,11 +480,6 @@ pub struct Buy<'info> {
         bump
     )]
     pub buyer_state: Account<'info, BuyerState>,
-    #[account(
-        seeds = [b"whitelist", state.key().as_ref(), buyer.key().as_ref()],
-        bump
-    )]
-    pub whitelist: Account<'info, WhitelistEntry>,
     pub system_program: Program<'info, System>,
 }
 
