@@ -3,7 +3,7 @@ use anchor_lang::system_program::{self, Transfer as SystemTransfer};
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("7V8Dz33M4tV4uPw1egTYaDJEyTUupMFRqZKwfZcZaGgb");
+declare_id!("kcMXBrJywtWtwMCGpwGdMNaj9xuQoyzFCVH59AYvHhY");
 
 // -----------------------------
 // Constantes
@@ -11,6 +11,7 @@ declare_id!("7V8Dz33M4tV4uPw1egTYaDJEyTUupMFRqZKwfZcZaGgb");
 const BPS_MAX: u16 = 10_000;
 const WEEK_SECONDS: u64 = 120; // 7 dias em segundos
 const RELEASE_PERCENTAGE: u16 = 750; // 7.5% em BPS
+const MIN_TOKENS_PER_PURCHASE: u64 = 10_000 * 1_000_000_000; // 10 mil tokens com 9 decimais
 
 // -----------------------------
 // Enums e Structs
@@ -186,6 +187,12 @@ pub mod presale {
         // Converter de volta para u64 (verificando se não excede u64::MAX)
         let tokens = u64::try_from(tokens_128).map_err(|_| PresaleError::MathOverflow)?;
 
+        // NOVA VERIFICAÇÃO: Mínimo de 10 mil tokens por compra
+        require!(
+            tokens >= MIN_TOKENS_PER_PURCHASE,
+            PresaleError::MinimumTokensNotMet
+        );
+
         // VERIFICAÇÕES COM VALORES CONSISTENTES
         match state.current_phase {
             Phase::Whitelist => {
@@ -267,6 +274,7 @@ pub mod presale {
         msg!("Tokens per SOL: {}", tokens_per_sol);
         msg!("Tokens calculated: {}", tokens);
         msg!("Tokens human readable: {}", tokens as f64 / 1_000_000_000.0);
+        msg!("Minimum tokens required: {}", MIN_TOKENS_PER_PURCHASE);
         msg!("=================");
 
         Ok(())
@@ -278,10 +286,6 @@ pub mod presale {
         let state = &mut ctx.accounts.state;
 
         require!(!state.finalized, PresaleError::AlreadyFinalized);
-        require!(
-            clock.unix_timestamp as u64 >= state.end_ts,
-            PresaleError::SaleNotEnded
-        );
 
         state.finalized = true;
         Ok(())
@@ -351,27 +355,6 @@ pub mod presale {
             .ok_or(PresaleError::MathOverflow)?;
 
         buyer_state.last_claim_ts = current_time;
-
-        Ok(())
-    }
-
-    /// Transfere os fundos arrecadados (SOL) para a tesouraria
-    pub fn withdraw_funds(ctx: Context<OnlyAuthority>) -> Result<()> {
-        let state = &mut ctx.accounts.state;
-        require!(state.finalized, PresaleError::NotFinalized);
-
-        let amount = state.to_account_info().lamports();
-        let rent_exempt = Rent::get()?.minimum_balance(std::mem::size_of::<PresaleState>());
-        let transferable = amount.saturating_sub(rent_exempt);
-
-        require!(transferable > 0, PresaleError::NothingToWithdraw);
-
-        **state.to_account_info().try_borrow_mut_lamports()? -= transferable;
-        **ctx
-            .accounts
-            .treasury
-            .to_account_info()
-            .try_borrow_mut_lamports()? += transferable;
 
         Ok(())
     }
@@ -719,4 +702,6 @@ pub enum PresaleError {
     InvalidInput,
     #[msg("Batch too large")]
     BatchTooLarge,
+    #[msg("Minimum tokens not met - must buy at least 10,000 tokens")]
+    MinimumTokensNotMet,
 }
